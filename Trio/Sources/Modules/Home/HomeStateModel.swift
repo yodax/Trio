@@ -498,31 +498,36 @@ extension Home {
                     // warmup / stabilizing / expiry. Simulator has no
                     // CGMManager, so fall back to reading its synthetic
                     // lifecycle / highlight so the bobble sees the same
-                    // data shape a real CGM would deliver.
+                    // data shape a real CGM would deliver. Other non-manager
+                    // sources publish their own state through `GlucoseSource`.
                     let manager = self.fetchGlucoseManager.cgmManager
                     let source = self.fetchGlucoseManager.glucoseSource
                     let progress: DeviceLifecycleProgress?
-                    let highlight: DeviceStatusHighlight?
+                    let displayState: CgmDisplayState?
                     if let manager {
                         progress = manager.cgmLifecycleProgress
-                        highlight = manager.cgmStatusHighlight
+                        displayState = manager.cgmStatusHighlight.map {
+                            CgmDisplayState(
+                                localizedMessage: $0.localizedMessage,
+                                imageName: $0.imageName,
+                                status: CgmDisplayStatus.from($0.state)
+                            )
+                        }
                     } else if let sim = source as? GlucoseSimulatorSource {
                         progress = sim.cgmLifecycleProgress
-                        highlight = sim.cgmStatusHighlight
+                        displayState = sim.cgmStatusHighlight.map {
+                            CgmDisplayState(
+                                localizedMessage: $0.localizedMessage,
+                                imageName: $0.imageName,
+                                status: CgmDisplayStatus.from($0.state)
+                            )
+                        }
                     } else {
-                        progress = nil
-                        highlight = nil
+                        progress = source?.cgmProgressHighlight.value
+                        displayState = source?.cgmDisplayState.value
                     }
                     self.cgmProgressHighlight = progress
-                    if let highlight {
-                        self.cgmDisplayState = CgmDisplayState(
-                            localizedMessage: highlight.localizedMessage,
-                            imageName: highlight.imageName,
-                            status: CgmDisplayStatus.from(highlight.state)
-                        )
-                    } else {
-                        self.cgmDisplayState = nil
-                    }
+                    self.cgmDisplayState = displayState
                     self.cgmSensorExpiresAt = Self.resolveSensorExpiresAt(
                         manager: manager,
                         glucoseSource: source,
@@ -914,9 +919,11 @@ extension Home {
         private func setupGlucoseTargets() async {
             let bgTargets = await provider.getBGTargets()
             let targetProfiles = processFetchedTargets(bgTargets, startMarker: startMarker)
+            let currentTarget = bgTargets.currentTarget()
             await MainActor.run {
                 self.bgTargets = bgTargets
                 self.targetProfiles = targetProfiles
+                if let currentTarget { self.currentGlucoseTarget = currentTarget }
             }
         }
 
@@ -926,12 +933,6 @@ extension Home {
                 await MainActor.run {
                     self.reservoir = reservoir
                 }
-            }
-        }
-
-        private func getCurrentGlucoseTarget() async {
-            if let target = bgTargets.currentTarget() {
-                await MainActor.run { currentGlucoseTarget = target }
             }
         }
 
@@ -1022,7 +1023,6 @@ extension Home.StateModel:
         lowGlucose = settingsManager.settings.low
         highGlucose = settingsManager.settings.high
         Task {
-            await getCurrentGlucoseTarget()
             await setupGlucoseTargets()
         }
         eA1cDisplayUnit = settingsManager.settings.eA1cDisplayUnit
