@@ -1,0 +1,114 @@
+diff --git a/TrioTests/CoreDataTests/GlucoseStorageTests.swift b/TrioTests/CoreDataTests/GlucoseStorageTests.swift
+index 032013a3..583a020c 100644
+--- a/TrioTests/CoreDataTests/GlucoseStorageTests.swift
++++ b/TrioTests/CoreDataTests/GlucoseStorageTests.swift
+@@ -260,6 +260,109 @@ import Testing
+         #expect(storage.alarm == nil, "Should not trigger any alarm")
+     }
+ 
++    // MARK: - CGM sensor start (cgm-state.json) handling
++
++    /// A sensor start as older CGMBLEKit stored it when a G6/Anubis reported "no active
++    /// session" (0xFFFFFFFF): activation date + 2^32-1 seconds, i.e. ~136 years ahead.
++    private func futureSensorStart() -> NightscoutTreatment {
++        let activation = Date().addingTimeInterval(-30 * 24 * 60 * 60)
++        return cgmStateTreatment(createdAt: activation.addingTimeInterval(TimeInterval(UInt32.max)))
++    }
++
++    private func cgmStateTreatment(createdAt: Date) -> NightscoutTreatment {
++        NightscoutTreatment(
++            duration: nil,
++            rawDuration: nil,
++            rawRate: nil,
++            absolute: nil,
++            rate: nil,
++            eventType: .nsSensorChange,
++            createdAt: createdAt,
++            enteredBy: NightscoutTreatment.local,
++            bolus: nil,
++            insulin: nil,
++            notes: "8H2EPF",
++            carbs: nil,
++            fat: nil,
++            protein: nil,
++            targetTop: nil,
++            targetBottom: nil
++        )
++    }
++
++    private func resetCGMStateFiles() -> FileStorage {
++        let fileStorage = resolver.resolve(FileStorage.self)!
++        fileStorage.remove(OpenAPS.Monitor.cgmState)
++        fileStorage.remove(OpenAPS.Nightscout.uploadedCGMState)
++        return fileStorage
++    }
++
++    @Test("Future-dated sensor starts are not offered for Nightscout upload") func testFutureSensorStartNotUploaded() async throws {
++        // Given a stored 2161/2162-style sensor start next to a valid one
++        let fileStorage = resetCGMStateFiles()
++        let validStart = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 - 2 * 24 * 60 * 60).rounded())
++        fileStorage.save([futureSensorStart(), cgmStateTreatment(createdAt: validStart)], as: OpenAPS.Monitor.cgmState)
++
++        // When
++        let toUpload = try await storage.getCGMStateNotYetUploadedToNightscout()
++
++        // Then only the valid sensor start is uploaded
++        #expect(toUpload.count == 1, "Only the valid sensor start should be uploaded")
++        #expect(toUpload.allSatisfy { ($0.createdAt ?? .distantFuture) <= Date() }, "No future-dated sensor start may be uploaded")
++        #expect(toUpload.first?.createdAt == validStart, "The valid sensor start should still be uploaded")
++    }
++
++    @Test("Future-dated sensor starts are pruned on the next CGM reading") func testFutureSensorStartPrunedOnStore() async throws {
++        // Given a stored 2161/2162-style sensor start next to a valid one
++        let fileStorage = resetCGMStateFiles()
++        let validStart = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 - 2 * 24 * 60 * 60).rounded())
++        fileStorage.save([futureSensorStart(), cgmStateTreatment(createdAt: validStart)], as: OpenAPS.Monitor.cgmState)
++
++        // When a regular CGM reading comes in for the same session
++        let now = Date()
++        try await storage.storeGlucose([
++            BloodGlucose(
++                direction: .flat,
++                date: Decimal(Int(now.timeIntervalSince1970 * 1000)),
++                dateString: now,
++                glucose: 111,
++                activationDate: validStart,
++                sessionStartDate: validStart,
++                transmitterID: "8H2EPF"
++            )
++        ])
++
++        // Then the future entry is gone and the valid one is kept
++        let stored = fileStorage.retrieve(OpenAPS.Monitor.cgmState, as: [NightscoutTreatment].self) ?? []
++        #expect(stored.allSatisfy { ($0.createdAt ?? .distantFuture) <= Date() }, "Future-dated sensor start should be pruned")
++        #expect(stored.contains { $0.createdAt == validStart }, "Valid sensor start should be kept")
++    }
++
++    @Test("A future session start from the CGM is not stored") func testFutureSessionStartNotStored() async throws {
++        // Given no stored sensor starts
++        let fileStorage = resetCGMStateFiles()
++
++        // When a reading arrives whose session start lies in the future
++        let now = Date()
++        try await storage.storeGlucose([
++            BloodGlucose(
++                direction: .flat,
++                date: Decimal(Int(now.timeIntervalSince1970 * 1000)),
++                dateString: now,
++                glucose: 112,
++                activationDate: now,
++                sessionStartDate: now.addingTimeInterval(TimeInterval(UInt32.max)),
++                transmitterID: "8H2EPF"
++            )
++        ])
++
++        // Then nothing is stored and nothing is offered for upload
++        let stored = fileStorage.retrieve(OpenAPS.Monitor.cgmState, as: [NightscoutTreatment].self) ?? []
++        #expect(stored.isEmpty, "Future session start must not be stored")
++        let toUpload = try await storage.getCGMStateNotYetUploadedToNightscout()
++        #expect(toUpload.isEmpty, "Future session start must not be uploaded")
++    }
++
+     /* Commenting out while we don't have getGlucoseStatus defined
+      @Test("getGlucoseStatus returns correct deltas for 0/5/15/30m readings") func testGetGlucoseStatusFourPoints() async throws {
+          let now = Date()
