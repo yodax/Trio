@@ -1,0 +1,181 @@
+name: Verify CGM sensor start patch
+run-name: Verify CGM sensor start patch (${{ github.ref_name }})
+
+# Proves patches/0001-drop-future-dated-cgm-sensor-start.patch before it ships:
+#   1. Without the fix, the new GlucoseStorage tests must FAIL (they reproduce the
+#      2161/2162 "CGM Sensor start" records seen in Nightscout).
+#   2. With the fix applied, the full app must compile and the same tests must PASS,
+#      together with all pre-existing GlucoseStorage tests.
+# Uses only the iOS simulator; no signing secrets, nothing is uploaded to TestFlight.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - claude/anubis-g6-future-start-5bvblg
+
+jobs:
+  verify:
+    name: Verify patch
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    env:
+      DESTINATION: "platform=iOS Simulator,name=iPhone 17,OS=26.2"
+      ONLY_TESTING: "TrioTests/GlucoseStorageTests"
+
+    steps:
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Apply tests only (no fix)
+        run: git apply -v patch-tests/0001-drop-future-dated-cgm-sensor-start-tests.patch
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -workspace Trio.xcworkspace \
+            -scheme "Trio Tests" \
+            -onlyUsePackageVersionsFromResolvedFile
+
+      - name: Build for testing (without fix)
+        run: |
+          set -o pipefail
+          xcodebuild build-for-testing \
+            -workspace Trio.xcworkspace \
+            -scheme "Trio Tests" \
+            -destination "$DESTINATION" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -disableAutomaticPackageResolution \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            -quiet \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            | tee build-without-fix.log
+
+      - name: Run tests (without fix, expected to fail)
+        id: without_fix
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building \
+            -workspace Trio.xcworkspace \
+            -scheme "Trio Tests" \
+            -destination "$DESTINATION" \
+            -only-testing:"$ONLY_TESTING" \
+            -parallel-testing-enabled NO \
+            2>&1 | tee test-without-fix.log
+
+      - name: Apply fix
+        run: git apply -v patches/0001-drop-future-dated-cgm-sensor-start.patch
+
+      - name: Build for testing (with fix)
+        run: |
+          set -o pipefail
+          xcodebuild build-for-testing \
+            -workspace Trio.xcworkspace \
+            -scheme "Trio Tests" \
+            -destination "$DESTINATION" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -disableAutomaticPackageResolution \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            -quiet \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            | tee build-with-fix.log
+
+      - name: Run tests (with fix, must pass)
+        id: with_fix
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building \
+            -workspace Trio.xcworkspace \
+            -scheme "Trio Tests" \
+            -destination "$DESTINATION" \
+            -only-testing:"$ONLY_TESTING" \
+            -parallel-testing-enabled NO \
+            2>&1 | tee test-with-fix.log
+
+      - name: Verdict
+        if: always()
+        shell: bash
+        run: |
+          # Swift Testing logs a test by its display name; match that or the function name.
+          new_tests=(
+            "Future-dated sensor starts are not offered for Nightscout upload|testFutureSensorStartNotUploaded"
+            "Future-dated sensor starts are pruned on the next CGM reading|testFutureSensorStartPrunedOnStore"
+            "A future session start from the CGM is not stored|testFutureSessionStartNotStored"
+          )
+          ok=true
+          {
+            echo "## CGM sensor start patch verification"
+            echo ""
+            echo "| Run | Expected | Outcome |"
+            echo "| --- | --- | --- |"
+            echo "| GlucoseStorageTests without fix | failure | ${{ steps.without_fix.outcome }} |"
+            echo "| GlucoseStorageTests with fix | success | ${{ steps.with_fix.outcome }} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ steps.without_fix.outcome }}" != "failure" ]; then
+            echo "::error::Tests passed without the fix, so they do not reproduce the bug."
+            ok=false
+          else
+            # The failure must come from the new tests, not from a crash or unrelated test.
+            for t in "${new_tests[@]}"; do
+              if grep -E "($t).*(failed|recorded an issue)" test-without-fix.log > /dev/null; then
+                echo "- without fix: \`$t\` failed as expected" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "::error::$t did not fail without the fix."
+                ok=false
+              fi
+            done
+          fi
+
+          if [ "${{ steps.with_fix.outcome }}" != "success" ]; then
+            echo "::error::Tests failed with the fix applied."
+            grep -nE "failed|recorded an issue|error:" test-with-fix.log | tail -n 40 || true
+            ok=false
+          else
+            for t in "${new_tests[@]}"; do
+              if grep -E "($t).*passed" test-with-fix.log > /dev/null; then
+                echo "- with fix: \`$t\` passed" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "::error::$t was not reported as passed with the fix."
+                ok=false
+              fi
+            done
+          fi
+
+          if [ "$ok" = true ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ Patch verified: tests reproduce the bug without the fix and pass with it." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ Patch NOT verified, see errors above." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-cgm-sensor-start-logs
+          path: "*.log"
+          if-no-files-found: ignore

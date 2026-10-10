@@ -1,0 +1,44 @@
+diff --git a/Trio/Sources/APS/Storage/GlucoseStorage.swift b/Trio/Sources/APS/Storage/GlucoseStorage.swift
+index 46af44bb..b6ebe7da 100644
+--- a/Trio/Sources/APS/Storage/GlucoseStorage.swift
++++ b/Trio/Sources/APS/Storage/GlucoseStorage.swift
+@@ -265,11 +265,18 @@ final class BaseGlucoseStorage: GlucoseStorage, Injectable {
+         debug(.deviceManager, "start storage cgmState")
+         storage.transaction { storage in
+             let file = OpenAPS.Monitor.cgmState
++            let now = Date()
+             var treatments = storage.retrieve(file, as: [NightscoutTreatment].self) ?? []
+-            var updated = false
++
++            // Drop future-dated sensor starts (e.g. 2161/2162 entries stored by older
++            // CGMBLEKit when a G6/Anubis reported "no active session" as 0xFFFFFFFF).
++            // The 30-day pruning below never removes them, so they would be re-uploaded forever.
++            let storedCount = treatments.count
++            treatments = treatments.filter { ($0.createdAt ?? .distantFuture) <= now }
++            var updated = treatments.count != storedCount
+ 
+             for x in glucose {
+-                guard let sessionStartDate = x.sessionStartDate else { continue }
++                guard let sessionStartDate = x.sessionStartDate, sessionStartDate <= now else { continue }
+ 
+                 // Skip if we already have a recent treatment
+                 if let lastTreatment = treatments.last,
+@@ -289,7 +296,7 @@ final class BaseGlucoseStorage: GlucoseStorage, Injectable {
+ 
+             if updated {
+                 storage.save(
+-                    treatments.filter { $0.createdAt?.addingTimeInterval(30.days.timeInterval) ?? .distantPast > Date() },
++                    treatments.filter { $0.createdAt?.addingTimeInterval(30.days.timeInterval) ?? .distantPast > now },
+                     as: file
+                 )
+             }
+@@ -594,7 +601,9 @@ final class BaseGlucoseStorage: GlucoseStorage, Injectable {
+             .retrieveAsync(OpenAPS.Monitor.cgmState, as: [NightscoutTreatment].self) ?? []
+ 
+         let (alreadyUploadedValues, allValuesSet) = await (alreadyUploaded, allValues)
++        let now = Date()
+         return Array(Set(allValuesSet).subtracting(Set(alreadyUploadedValues)))
++            .filter { ($0.createdAt ?? .distantFuture) <= now }
+     }
+ 
+     // Fetch glucose that is not uploaded to Nightscout yet
