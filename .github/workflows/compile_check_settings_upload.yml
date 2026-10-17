@@ -1,0 +1,85 @@
+name: Compile check (settings upload patch)
+run-name: Compile check (${{ github.ref_name }})
+
+# Compile evidence for patches/0002-trio-settings-upload.patch without shipping anything:
+# applies patches/* exactly like build_trio.yml, then builds the app, watch app, extensions
+# and test targets for the iOS simulator (build-for-testing). No signing, no fastlane, no
+# match, no App Store Connect secrets, no TestFlight upload. Runs only on pushes to the
+# feature branch. Delete this file before merging the feature branch into dev.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - trio-settings-upload
+
+jobs:
+  compile:
+    name: Build for simulator
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    env:
+      DESTINATION: "platform=iOS Simulator,name=iPhone 17,OS=26.2"
+
+    steps:
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Apply patches (as build_trio.yml does)
+        run: git apply ./patches/* --allow-empty -v --whitespace=fix
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -workspace Trio.xcworkspace \
+            -scheme "Trio Tests" \
+            -onlyUsePackageVersionsFromResolvedFile
+
+      - name: Build for testing
+        run: |
+          set -o pipefail
+          xcodebuild build-for-testing \
+            -workspace Trio.xcworkspace \
+            -scheme "Trio Tests" \
+            -destination "$DESTINATION" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -disableAutomaticPackageResolution \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            | tee build.log
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Compile check"
+            echo ""
+            echo "Patches applied: $(ls patches/*.patch | tr '\n' ' ')"
+            echo ""
+            echo "Result: ${{ job.status }}"
+            echo ""
+            echo '```'
+            grep -E "error:|BUILD (SUCCEEDED|FAILED)|TEST BUILD (SUCCEEDED|FAILED)" build.log | tail -n 40 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-check-log
+          path: build.log
+          if-no-files-found: ignore
