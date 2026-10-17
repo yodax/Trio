@@ -1,0 +1,40 @@
+name: Patch Guard
+run-name: Patch guard (${{ github.ref_name }})
+
+# Fails loudly, within a minute of an upstream sync, when a file in patches/ no longer
+# applies to dev. Otherwise the same problem only surfaces later as a failed
+# "Customize Trio" step in "4. Build Trio". A patch that does not apply fails the build
+# before anything is archived or uploaded, so an unpatched app never reaches TestFlight.
+# This is a separate file on purpose: build_trio.yml stays identical to upstream.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dev
+    paths:
+      - "Trio/**"
+      - "patches/**"
+      - ".github/workflows/patch_guard.yml"
+
+jobs:
+  check:
+    name: Check patches apply
+    if: github.repository_owner != 'nightscout'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: git apply --check patches/*
+        run: |
+          # Same command and flags as the "Customize Trio" step in build_trio.yml, in check mode.
+          if ! ls ./patches/* &> /dev/null; then
+            echo "No files in patches/."
+            exit 0
+          fi
+          if ! git apply --check ./patches/* --allow-empty -v --whitespace=fix; then
+            echo "::error title=Patch no longer applies::A file in patches/ does not apply to $GITHUB_REF_NAME after the upstream sync (see the git output above for the file and line). The next '4. Build Trio' run will fail at 'Customize Trio'. Rebase that patch onto current $GITHUB_REF_NAME and commit it before the next build."
+            exit 1
+          fi
+          echo "All patches apply cleanly."

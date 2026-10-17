@@ -8,6 +8,21 @@ build the app and ship it to TestFlight for a family member with T1 diabetes.
 Claude's job in this repo is to help diagnose and fix failed GitHub Actions workflow runs and Fastlane
 build/signing issues — not to write app features.
 
+**Exceptions, all shipped only as files in `patches/` (never as edits to app sources on `dev`):**
+
+- `patches/0001-drop-future-dated-cgm-sensor-start.patch` — drops future-dated CGM sensor starts.
+- `patches/0002-trio-settings-upload.patch` — Michael-approved (2026-10-17) feature: attaches the full settings
+  (the Settings -> Export CSV plus raw preferences/settings JSON) to the Nightscout profile document Trio already
+  uploads, for the dynisf-tuner and the watcher. The payload contract is `docs/trio-settings-upload.md`; change
+  it there and bump `schemaVersion` if the shape changes. The patch must stay read-only with respect to dosing and
+  must never be able to throw into or delay the profile upload (errors are logged and the profile goes without the field).
+
+`build_trio.yml` applies them with `git apply ./patches/*`. When the weekly upstream sync makes a patch stop applying,
+`.github/workflows/patch_guard.yml` fails right after the sync and the build fails at "Customize Trio" (before anything
+is archived or uploaded). The fix is to rebase the patch onto current `dev` (`git apply --check patches/*` to verify),
+not to edit app sources on `dev`. Patch changes need compile evidence from a simulator build that has no TestFlight step
+(see `.github/workflows/compile_check_settings_upload.yml` for the pattern) and Michael's OK before they reach `dev`.
+
 ## How the build pipeline works
 
 Four workflows in `.github/workflows/`, chained together, using [Fastlane](https://fastlane.tools) lanes
@@ -62,7 +77,8 @@ over guessing from memory.
 
 ## Working conventions
 
-- This is a config/CI-only repo from Claude's perspective — do not propose Swift/app code changes.
+- This is a config/CI-only repo from Claude's perspective — do not propose Swift/app code changes, except
+  maintaining the patches in `patches/` listed above.
 - Prefer read diagnosis first; only change repo variables or re-run workflows once the root cause from the
   logs is clear.
 - Never print or persist secret values (`GH_PAT`, `MATCH_PASSWORD`, `FASTLANE_KEY`, etc.) into logs, files,

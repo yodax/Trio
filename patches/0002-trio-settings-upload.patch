@@ -1,0 +1,301 @@
+Trio settings upload: attach the full settings to the Nightscout profile document.
+
+Fork-only patch (see CLAUDE.md "Exception: settings upload patch" and
+docs/trio-settings-upload.md for the payload contract). Applied by build_trio.yml
+via `git apply ./patches/*`; guarded by .github/workflows/patch_guard.yml.
+Read-only with respect to dosing: it only reads settings and adds one optional
+field (`trioSettings`) to the profile document that Trio already uploads.
+
+diff --git a/Trio/Sources/Models/NightscoutStatus.swift b/Trio/Sources/Models/NightscoutStatus.swift
+index f4c06557e..caccfe800 100644
+--- a/Trio/Sources/Models/NightscoutStatus.swift
++++ b/Trio/Sources/Models/NightscoutStatus.swift
+@@ -63,6 +63,21 @@ struct NightscoutProfileStore: JSON {
+     let overridePresets: [NightscoutPresetOverride]?
+     let teamID: String
+     let expirationDate: Date?
++    /// Optional full-settings attachment, see docs/trio-settings-upload.md.
++    var trioSettings: NightscoutTrioSettings?
++}
++
++/// Full Trio settings attached to the uploaded profile document (contract: docs/trio-settings-upload.md).
++struct NightscoutTrioSettings: JSON {
++    let schemaVersion: Int
++    let exportedAt: Date
++    let appVersion: String
++    let build: String
++    /// Same rows as Settings -> Export (localised, BOM stripped), minus the Metadata category.
++    let csv: String
++    let preferences: Preferences
++    let settings: TrioSettings
++    let pumpSettings: PumpSettings
+ }
+ 
+ struct NightscoutPresetOverride: JSON {
+diff --git a/Trio/Sources/Modules/SettingsExport/SettingsExportStateModel.swift b/Trio/Sources/Modules/SettingsExport/SettingsExportStateModel.swift
+index 94016f450..9cc186bf3 100644
+--- a/Trio/Sources/Modules/SettingsExport/SettingsExportStateModel.swift
++++ b/Trio/Sources/Modules/SettingsExport/SettingsExportStateModel.swift
+@@ -108,6 +108,16 @@ extension SettingsExport {
+             let fileURL = documentsDirectory.appendingPathComponent(fileName)
+             debug(.default, "Export file path: \(fileURL.path)")
+ 
++            switch await buildExportRows(categories: categoriesToExport) {
++            case let .success(exportSettings):
++                return writeExportFile(exportSettings, to: fileURL)
++            case let .failure(error):
++                return .failure(error)
++            }
++        }
++
++        /// Builds the export rows. Read-only; also used by `NightscoutManager` for the profile upload.
++        func buildExportRows(categories categoriesToExport: Set<ExportCategory>) async -> Result<[ExportSetting], ExportError> {
+             var exportSettings: [ExportSetting] = []
+ 
+             let trioSettings = settingsManager.settings
+@@ -1235,24 +1245,31 @@ extension SettingsExport {
+                 }
+             }
+ 
+-            // Convert data to the selected format and write to file
+-            do {
+-                let content: String
+-                // Helper function to escape CSV values
+-                func csvEscape(_ value: String) -> String {
+-                    if value.contains(",") || value.contains("\"") || value.contains("\n") || value.contains("\r") {
+-                        return "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+-                    }
+-                    return value
++            return .success(exportSettings)
++        }
++
++        /// The export CSV text (with BOM), as written to the export file.
++        func csvText(for exportSettings: [ExportSetting]) -> String {
++            func csvEscape(_ value: String) -> String {
++                if value.contains(",") || value.contains("\"") || value.contains("\n") || value.contains("\r") {
++                    return "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+                 }
++                return value
++            }
+ 
+-                var csvContent = "\u{FEFF}Setting Category,Subcategory,Setting Name,Value,Unit\n"
++            var csvContent = "\u{FEFF}Setting Category,Subcategory,Setting Name,Value,Unit\n"
+ 
+-                for setting in exportSettings {
+-                    csvContent +=
+-                        "\(csvEscape(setting.category)),\(csvEscape(setting.subcategory)),\(csvEscape(setting.name)),\(csvEscape(setting.value)),\(csvEscape(setting.unit))\n"
+-                }
+-                content = csvContent
++            for setting in exportSettings {
++                csvContent +=
++                    "\(csvEscape(setting.category)),\(csvEscape(setting.subcategory)),\(csvEscape(setting.name)),\(csvEscape(setting.value)),\(csvEscape(setting.unit))\n"
++            }
++            return csvContent
++        }
++
++        private func writeExportFile(_ exportSettings: [ExportSetting], to fileURL: URL) -> Result<URL, ExportError> {
++            // Convert data to the selected format and write to file
++            do {
++                let content = csvText(for: exportSettings)
+ 
+                 debug(
+                     .default,
+diff --git a/Trio/Sources/Services/Network/Nightscout/NightscoutManager.swift b/Trio/Sources/Services/Network/Nightscout/NightscoutManager.swift
+index 01f7781be..ce1aca12b 100644
+--- a/Trio/Sources/Services/Network/Nightscout/NightscoutManager.swift
++++ b/Trio/Sources/Services/Network/Nightscout/NightscoutManager.swift
+@@ -1,5 +1,6 @@
+ import Combine
+ import CoreData
++import CryptoKit
+ import Foundation
+ import LoopKit
+ import LoopKitUI
+@@ -22,7 +23,7 @@ protocol NightscoutManager: GlucoseSource {
+     var cgmURL: URL? { get }
+ }
+ 
+-final class BaseNightscoutManager: NightscoutManager, Injectable {
++final class BaseNightscoutManager: NightscoutManager, Injectable, SettingsObserver, PreferencesObserver, PumpSettingsObserver {
+     @Injected() private var keychain: Keychain!
+     @Injected() private var determinationStorage: DeterminationStorage!
+     @Injected() var glucoseStorage: GlucoseStorage!
+@@ -39,6 +40,8 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+     @Injected() private var apsManager: APSManager!
+ 
+     private let processQueue = DispatchQueue(label: "BaseNetworkManager.processQueue")
++    private var settingsExportResolver: Resolver?
++    private var pendingTrioSettingsUpload: DispatchWorkItem?
+     private var ping: TimeInterval?
+ 
+     /// Coalesces and serializes upload runs so no two runs of the same pipeline overlap.
+@@ -264,6 +267,15 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+ 
+     init(resolver: Resolver) {
+         injectServices(resolver)
++        settingsExportResolver = resolver
++        broadcaster.register(SettingsObserver.self, observer: self)
++        broadcaster.register(PreferencesObserver.self, observer: self)
++        broadcaster.register(PumpSettingsObserver.self, observer: self)
++        // App start and hourly: re-attach the settings if the last attachment is older than a day.
++        scheduleTrioSettingsUpload(delay: 120, onlyIfStale: true)
++        Timer.publish(every: 3600, on: .main, in: .common).autoconnect()
++            .sink { [weak self] _ in self?.scheduleTrioSettingsUpload(delay: 0, onlyIfStale: true) }
++            .store(in: &subscriptions)
+ 
+         uploadSerializer = NightscoutUploadSerializer { [weak self] pipeline in
+             await self?.performUpload(for: pipeline)
+@@ -841,7 +853,7 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+                 let teamID = Bundle.main.object(forInfoDictionaryKey: "TeamID") as? String ?? ""
+                 let expireDate = BuildDetails.shared.calculateExpirationDate()
+ 
+-                let profileStore = NightscoutProfileStore(
++                var profileStore = NightscoutProfileStore(
+                     defaultProfile: defaultProfile,
+                     startDate: now,
+                     mills: Int(now.timeIntervalSince1970) * 1000,
+@@ -856,6 +868,10 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+                     expirationDate: expireDate
+                 )
+ 
++                // Read-only extra: never throws, bounded by a timeout. On any problem the profile goes without it.
++                let trioSettings = await makeTrioSettingsAttachment()
++                profileStore.trioSettings = trioSettings?.payload
++
+                 guard let nightscout = nightscoutAPI, isNetworkReachable else {
+                     if !isNetworkReachable {
+                         debug(.nightscout, "Network issues; aborting upload")
+@@ -866,6 +882,11 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+ 
+                 try await nightscout.uploadProfile(profileStore)
+ 
++                if let trioSettings = trioSettings {
++                    UserDefaults.standard.set(trioSettings.hash, forKey: Self.trioSettingsHashKey)
++                    UserDefaults.standard.set(Date(), forKey: Self.trioSettingsDateKey)
++                }
++
+                 BuildDetails.shared.recordUploadedExpireDate(expireDate: expireDate)
+ 
+                 debug(.nightscout, "Profile uploaded")
+@@ -878,6 +899,121 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+         }
+     }
+ 
++    // MARK: - Full settings attached to the profile (docs/trio-settings-upload.md)
++
++    private typealias TrioSettingsAttachment = (payload: NightscoutTrioSettings, hash: String)
++
++    private static let trioSettingsSchemaVersion = 1
++    private static let trioSettingsHashKey = "trioSettingsUploadHash"
++    private static let trioSettingsDateKey = "trioSettingsUploadDate"
++    private static let trioSettingsMaxAge: TimeInterval = 23 * 3600
++    private static let trioSettingsMaxBytes = 200_000 // Nightscout rejects request bodies over 1 MB
++
++    private var trioSettingsAttachmentIsStale: Bool {
++        guard let last = UserDefaults.standard.object(forKey: Self.trioSettingsDateKey) as? Date else { return true }
++        return Date().timeIntervalSince(last) > Self.trioSettingsMaxAge
++    }
++
++    func settingsDidChange(_: TrioSettings) { scheduleTrioSettingsUpload(delay: 10, onlyIfStale: false) }
++    func preferencesDidChange(_: Preferences) { scheduleTrioSettingsUpload(delay: 10, onlyIfStale: false) }
++    func pumpSettingsDidChange(_: PumpSettings) { scheduleTrioSettingsUpload(delay: 10, onlyIfStale: false) }
++
++    /// Debounced profile upload so a settings change reaches Nightscout without waiting for a profile edit.
++    private func scheduleTrioSettingsUpload(delay: TimeInterval, onlyIfStale: Bool) {
++        processQueue.async { [weak self] in
++            guard let self = self else { return }
++            self.pendingTrioSettingsUpload?.cancel()
++            let workItem = DispatchWorkItem { [weak self] in
++                guard let self = self, !onlyIfStale || self.trioSettingsAttachmentIsStale else { return }
++                Task {
++                    do { try await self.uploadProfiles() } catch {
++                        debug(.nightscout, "Settings-triggered profile upload failed: \(error)")
++                    }
++                }
++            }
++            self.pendingTrioSettingsUpload = workItem
++            self.processQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
++        }
++    }
++
++    private final class OneShot: @unchecked Sendable {
++        private let lock = NSLock()
++        private var fired = false
++        func claim() -> Bool {
++            lock.lock(); defer { lock.unlock() }
++            if fired { return false }
++            fired = true
++            return true
++        }
++    }
++
++    /// Returns nil (profile uploads without settings) on any error, on timeout, or when nothing changed
++    /// since the last attachment (a changed hash, or an attachment older than a day, is attached again).
++    private func makeTrioSettingsAttachment() async -> TrioSettingsAttachment? {
++        await withCheckedContinuation { (continuation: CheckedContinuation<TrioSettingsAttachment?, Never>) in
++            let gate = OneShot()
++            Task {
++                let result = await self.buildTrioSettingsAttachment()
++                if gate.claim() { continuation.resume(returning: result) }
++            }
++            Task {
++                try? await Task.sleep(nanoseconds: 10 * 1_000_000_000)
++                if gate.claim() {
++                    debug(.nightscout, "Trio settings attachment timed out; uploading profile without it")
++                    continuation.resume(returning: nil)
++                }
++            }
++        }
++    }
++
++    private func buildTrioSettingsAttachment() async -> TrioSettingsAttachment? {
++        guard let resolver = settingsExportResolver else { return nil }
++        do {
++            let stateModel = await MainActor.run { () -> SettingsExport.StateModel in
++                let model = SettingsExport.StateModel()
++                model.resolver = resolver
++                return model
++            }
++            let categories = Set(SettingsExport.StateModel.ExportCategory.allCases.filter { $0 != .metadata })
++            let rows = try await stateModel.buildExportRows(categories: categories).get()
++            var csv = stateModel.csvText(for: rows)
++            if csv.hasPrefix("\u{FEFF}") { csv.removeFirst() }
++
++            func payload(exportedAt: Date) -> NightscoutTrioSettings {
++                NightscoutTrioSettings(
++                    schemaVersion: Self.trioSettingsSchemaVersion,
++                    exportedAt: exportedAt,
++                    appVersion: Bundle.main.appDevVersion ?? "unknown",
++                    build: Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown",
++                    csv: csv,
++                    preferences: settingsManager.preferences,
++                    settings: settingsManager.settings,
++                    pumpSettings: settingsManager.pumpSettings
++                )
++            }
++
++            // Hash excludes the export timestamp, so only a real change (or the daily refresh) re-attaches.
++            let hashEncoder = JSONEncoder()
++            hashEncoder.outputFormatting = [.sortedKeys]
++            let digest = SHA256.hash(data: try hashEncoder.encode(payload(exportedAt: .distantPast)))
++            let hash = digest.map { String(format: "%02x", $0) }.joined()
++            if hash == UserDefaults.standard.string(forKey: Self.trioSettingsHashKey), !trioSettingsAttachmentIsStale {
++                return nil
++            }
++
++            let result = payload(exportedAt: Date())
++            let size = try JSONCoding.encoder.encode(result).count // same encoder as the upload
++            guard size <= Self.trioSettingsMaxBytes else {
++                debug(.nightscout, "Trio settings attachment too large (\(size) bytes); uploading profile without it")
++                return nil
++            }
++            return (result, hash)
++        } catch {
++            debug(.nightscout, "Trio settings attachment failed: \(error); uploading profile without it")
++            return nil
++        }
++    }
++
+     func importSettings() async -> ScheduledNightscoutProfile? {
+         guard let nightscout = nightscoutAPI else {
+             debug(.nightscout, "NS API not available. Aborting NS Status upload.")
