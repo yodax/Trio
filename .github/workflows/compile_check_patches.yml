@@ -1,4 +1,3 @@
-@@ -1,85 +0,0 @@
 name: Compile check (settings upload patch)
 run-name: Compile check (${{ github.ref_name }})
 
