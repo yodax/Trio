@@ -1,9 +1,9 @@
 diff --git a/Trio/Sources/APS/Storage/GlucoseStorage.swift b/Trio/Sources/APS/Storage/GlucoseStorage.swift
-index 46af44bb..b6ebe7da 100644
+index 3e999f2cc..699c85cc5 100644
 --- a/Trio/Sources/APS/Storage/GlucoseStorage.swift
 +++ b/Trio/Sources/APS/Storage/GlucoseStorage.swift
-@@ -265,11 +265,18 @@ final class BaseGlucoseStorage: GlucoseStorage, Injectable {
-         debug(.deviceManager, "start storage cgmState")
+@@ -254,11 +254,18 @@ final class BaseGlucoseStorage: GlucoseStorage, Injectable {
+     private func storeCGMState(_ glucose: [BloodGlucose]) {
          storage.transaction { storage in
              let file = OpenAPS.Monitor.cgmState
 +            let now = Date()
@@ -23,7 +23,7 @@ index 46af44bb..b6ebe7da 100644
  
                  // Skip if we already have a recent treatment
                  if let lastTreatment = treatments.last,
-@@ -289,7 +296,7 @@ final class BaseGlucoseStorage: GlucoseStorage, Injectable {
+@@ -278,7 +285,7 @@ final class BaseGlucoseStorage: GlucoseStorage, Injectable {
  
              if updated {
                  storage.save(
@@ -32,7 +32,7 @@ index 46af44bb..b6ebe7da 100644
                      as: file
                  )
              }
-@@ -594,7 +601,9 @@ final class BaseGlucoseStorage: GlucoseStorage, Injectable {
+@@ -589,7 +596,9 @@ final class BaseGlucoseStorage: GlucoseStorage, Injectable {
              .retrieveAsync(OpenAPS.Monitor.cgmState, as: [NightscoutTreatment].self) ?? []
  
          let (alreadyUploadedValues, allValuesSet) = await (alreadyUploaded, allValues)

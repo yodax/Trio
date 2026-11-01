@@ -7,10 +7,10 @@ Read-only with respect to dosing: it only reads settings and adds one optional
 field (`trioSettings`) to the profile document that Trio already uploads.
 
 diff --git a/Trio/Sources/Models/NightscoutStatus.swift b/Trio/Sources/Models/NightscoutStatus.swift
-index 72f5ecc0a..fc0123286 100644
+index 439e77d96..e1a3d9cb3 100644
 --- a/Trio/Sources/Models/NightscoutStatus.swift
 +++ b/Trio/Sources/Models/NightscoutStatus.swift
-@@ -65,6 +65,21 @@ struct NightscoutProfileStore: JSON {
+@@ -80,6 +80,21 @@ struct NightscoutProfileStore: JSON {
      let expirationDate: Date?
      /// Remote command types this build accepts; followers hide unsupported actions.
      let remoteCommands: [String]?
@@ -33,12 +33,12 @@ index 72f5ecc0a..fc0123286 100644
  
  struct NightscoutPresetOverride: JSON {
 diff --git a/Trio/Sources/Modules/SettingsExport/SettingsExportStateModel.swift b/Trio/Sources/Modules/SettingsExport/SettingsExportStateModel.swift
-index c7538095e..6adf93e8f 100644
+index 3562eb045..af8a65584 100644
 --- a/Trio/Sources/Modules/SettingsExport/SettingsExportStateModel.swift
 +++ b/Trio/Sources/Modules/SettingsExport/SettingsExportStateModel.swift
-@@ -108,6 +108,16 @@ extension SettingsExport {
+@@ -102,6 +102,16 @@ extension SettingsExport {
+             }
              let fileURL = documentsDirectory.appendingPathComponent(fileName)
-             debug(.default, "Export file path: \(fileURL.path)")
  
 +            switch await buildExportRows(categories: categoriesToExport) {
 +            case let .success(exportSettings):
@@ -53,7 +53,7 @@ index c7538095e..6adf93e8f 100644
              var exportSettings: [ExportSetting] = []
  
              let trioSettings = settingsManager.settings
-@@ -1255,24 +1265,31 @@ extension SettingsExport {
+@@ -1242,24 +1252,31 @@ extension SettingsExport {
                  }
              }
  
@@ -98,10 +98,10 @@ index c7538095e..6adf93e8f 100644
 +            do {
 +                let content = csvText(for: exportSettings)
  
-                 debug(
-                     .default,
+                 debug(.settings, "Writing settings export (\(content.count) characters)")
+ 
 diff --git a/Trio/Sources/Services/Network/Nightscout/NightscoutManager.swift b/Trio/Sources/Services/Network/Nightscout/NightscoutManager.swift
-index d9a958935..e650add19 100644
+index 62223f742..3e756e237 100644
 --- a/Trio/Sources/Services/Network/Nightscout/NightscoutManager.swift
 +++ b/Trio/Sources/Services/Network/Nightscout/NightscoutManager.swift
 @@ -1,5 +1,6 @@
@@ -120,7 +120,7 @@ index d9a958935..e650add19 100644
      @Injected() private var keychain: Keychain!
      @Injected() private var determinationStorage: DeterminationStorage!
      @Injected() var glucoseStorage: GlucoseStorage!
-@@ -40,6 +41,8 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+@@ -41,6 +42,8 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
      @Injected() private var apsManager: APSManager!
  
      private let processQueue = DispatchQueue(label: "BaseNetworkManager.processQueue")
@@ -129,7 +129,7 @@ index d9a958935..e650add19 100644
      private var ping: TimeInterval?
  
      /// Coalesces and serializes upload runs so no two runs of the same pipeline overlap.
-@@ -265,6 +268,15 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+@@ -266,6 +269,15 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
  
      init(resolver: Resolver) {
          injectServices(resolver)
@@ -145,7 +145,7 @@ index d9a958935..e650add19 100644
  
          uploadSerializer = NightscoutUploadSerializer { [weak self] pipeline in
              await self?.performUpload(for: pipeline)
-@@ -845,7 +857,7 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+@@ -861,7 +873,7 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
                  let expireDate = BuildDetails.shared.calculateExpirationDate()
                  let remoteCommands = TrioRemoteControl.CommandType.supported.map(\.rawValue)
  
@@ -154,7 +154,7 @@ index d9a958935..e650add19 100644
                      defaultProfile: defaultProfile,
                      startDate: now,
                      mills: Int(now.timeIntervalSince1970) * 1000,
-@@ -861,6 +873,10 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+@@ -877,6 +889,10 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
                      remoteCommands: remoteCommands
                  )
  
@@ -164,8 +164,8 @@ index d9a958935..e650add19 100644
 +
                  guard let nightscout = nightscoutAPI, isNetworkReachable else {
                      if !isNetworkReachable {
-                         debug(.nightscout, "Network issues; aborting upload")
-@@ -871,6 +887,11 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+                         debug(.nightscout, "Profile upload skipped: network unreachable")
+@@ -888,6 +904,11 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
  
                  try await nightscout.uploadProfile(profileStore)
  
@@ -177,7 +177,7 @@ index d9a958935..e650add19 100644
                  BuildDetails.shared.recordUploadedExpireDate(expireDate: expireDate)
                  BuildDetails.shared.recordUploadedRemoteCommands(remoteCommands)
  
-@@ -884,6 +905,121 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
+@@ -901,6 +922,121 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
          }
      }
  
@@ -298,4 +298,4 @@ index d9a958935..e650add19 100644
 +
      func importSettings() async -> ScheduledNightscoutProfile? {
          guard let nightscout = nightscoutAPI else {
-             debug(.nightscout, "NS API not available. Aborting NS Status upload.")
+             debug(.nightscout, "Settings import skipped: Nightscout not set up")
